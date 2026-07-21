@@ -3,7 +3,6 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-// jednoduchý access log (uvidíš v Render Logs, že webhook chodí)
 app.use((req, res, next) => {
   console.log("INCOMING", req.method, req.path);
   next();
@@ -19,7 +18,7 @@ const sessions = new Map();
 app.get("/", (req, res) => res.send("ok"));
 
 app.post("/telegram", async (req, res) => {
-  console.log("BODY", JSON.stringify(req.body)); // klíčové pro debug
+  console.log("BODY", JSON.stringify(req.body));
 
   try {
     const msg = req.body?.message;
@@ -32,15 +31,11 @@ app.post("/telegram", async (req, res) => {
     }
 
     if (!TELEGRAM_BOT_TOKEN || !VAPI_PRIVATE_KEY || !VAPI_ASSISTANT_ID) {
-      console.log("MISSING ENV VARS", {
-        hasTelegramToken: !!TELEGRAM_BOT_TOKEN,
-        hasVapiKey: !!VAPI_PRIVATE_KEY,
-        hasAssistantId: !!VAPI_ASSISTANT_ID
-      });
+      console.log("MISSING ENV VARS");
       return res.sendStatus(200);
     }
 
-    // 1) session
+    // 1) session (session už je svázaná s asistentem)
     let sessionId = sessions.get(chatId);
     if (!sessionId) {
       const sResp = await fetch("https://api.vapi.ai/session", {
@@ -62,7 +57,7 @@ app.post("/telegram", async (req, res) => {
       if (sessionId) sessions.set(chatId, sessionId);
     }
 
-    // 2) Vapi chat
+    // 2) Vapi chat — POZOR: tady už NESMÍ být assistantId
     const chatResp = await fetch("https://api.vapi.ai/chat", {
       method: "POST",
       headers: {
@@ -70,7 +65,6 @@ app.post("/telegram", async (req, res) => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        assistantId: VAPI_ASSISTANT_ID,
         sessionId,
         input: text
       })
@@ -79,7 +73,6 @@ app.post("/telegram", async (req, res) => {
     const chat = await chatResp.json();
     console.log("CHAT RES", chatResp.status, chat);
 
-    // 3) reply
     const reply =
       (Array.isArray(chat?.output) &&
         chat.output.map((o) => o?.content).filter(Boolean).join("\n")) ||
@@ -88,7 +81,6 @@ app.post("/telegram", async (req, res) => {
       chat?.message ||
       "Vapi nevrátilo textovou odpověď.";
 
-    // 4) Telegram odpověď
     const tgResp = await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
