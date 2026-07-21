@@ -4,10 +4,17 @@ const app = express();
 app.use(express.json());
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Nastav v Render env varu, až uvidíš seznam modelů:
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const VAPI_PRIVATE_KEY = process.env.VAPI_PRIVATE_KEY;
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-flash-lite-latest";
+
+// chatId -> vapiSessionId
+const sessions = new Map();
+
+app.get("/", (req, res) => res.send("ok"));
 
 async function telegramApi(method, body) {
   const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
@@ -30,25 +37,26 @@ async function getTelegramFileBytes(fileId) {
   return Buffer.from(arrayBuffer);
 }
 
-// ListModels helper (debug)
-app.get("/gemini-models", async (req, res) => {
-  try {
-    if (!GEMINI_API_KEY) return res.status(400).json({ error: "Missing GEMINI_API_KEY" });
-
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`
-    );
-    const data = await r.json();
-    res.status(r.status).json(data);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
+function pickImageFromTelegramMessage(msg) {
+  // photo
+  if (Array.isArray(msg?.photo) && msg.photo.length > 0) {
+    const best = msg.photo[msg.photo.length - 1];
+    return { fileId: best.file_id, mimeType: "image/jpeg", source: "photo" };
   }
-});
+  // document (image/*)
+  const doc = msg?.document;
+  if (doc?.file_id) {
+    const mt = doc.mime_type || "";
+    if (mt.startsWith("image/")) {
+      return { fileId: doc.file_id, mimeType: mt, source: "document" };
+    }
+  }
+  return null;
+}
 
-async function analyzeWithGemini({ imageBytes, prompt }) {
+async function analyzeWithGemini({ imageBytes, mimeType, prompt }) {
   if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
 
-  // IMPORTANT: model name must be prefixed with "models/"
   const modelPath = GEMINI_MODEL.startsWith("models/") ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
 
   const resp = await fetch(
@@ -64,7 +72,7 @@ async function analyzeWithGemini({ imageBytes, prompt }) {
               { text: prompt || "Popiš, co je na obrázku. Pokud je tam text, přepiš ho." },
               {
                 inlineData: {
-                  mimeType: "image/jpeg",
+                  mimeType: mimeType || "image/jpeg",
                   data: imageBytes.toString("base64")
                 }
               }
@@ -82,10 +90,50 @@ async function analyzeWithGemini({ imageBytes, prompt }) {
     data?.error?.message ||
     JSON.stringify(data);
 
-  return { status: resp.status, text, raw: data };
+  return text;
 }
 
-app.get("/", (req, res) => res.send("ok"));
+async function getOrCreateVapiSession(chatId) {
+  let sessionId = sessions.get(chatId);
+  if (sessionId) return sessionId;
+
+  const sResp = await fetch("https://api.vapi.ai/session", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${VAPI_PRIVATE_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      assistantId: VAPI_ASSISTANT_ID,
+      name: `tg:${chatId}`
+    })
+  });
+
+  const s = await sResp.json();
+  sessionId = s?.id;
+  if (sessionId) sessions.set(chatId, sessionId);
+  return sessionId;
+}
+
+async function vapiChat({ sessionId, input }) {
+  const cResp = await fetch("https://api.vapi.ai/chat", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${VAPI_PRIVATE_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ sessionId, input })
+  });
+
+  const chat = await cResp.json();
+
+  const reply =
+    (Array.isArray(chat?.output) && chat.output.map(o => o?.content).filter(Boolean).join("\n")) ||
+    chat?.message ||
+    "Vapi nevrátilo odpověď.";
+
+  return reply;
+}
 
 app.post("/telegram", async (req, res) => {
   try {
@@ -93,31 +141,43 @@ app.post("/telegram", async (req, res) => {
     const chatId = msg?.chat?.id;
     if (!chatId) return res.sendStatus(200);
 
-    if (Array.isArray(msg?.photo) && msg.photo.length > 0) {
-      const best = msg.photo[msg.photo.length - 1];
-      const fileId = best.file_id;
+    if (!TELEGRAM_BOT_TOKEN || !VAPI_PRIVATE_KEY || !VAPI_ASSISTANT_ID) {
+      await telegramApi("sendMessage", { chat_id: chatId, text: "Server není nakonfigurovaný (chybí env vars)." });
+      return res.sendStatus(200);
+    }
 
+    const sessionId = await getOrCreateVapiSession(chatId);
+
+    // IMAGE path
+    const image = pickImageFromTelegramMessage(msg);
+    if (image) {
+      const bytes = await getTelegramFileBytes(image.fileId);
       const caption = msg.caption || "";
-      const bytes = await getTelegramFileBytes(fileId);
-
-      const result = await analyzeWithGemini({
+      const geminiText = await analyzeWithGemini({
         imageBytes: bytes,
+        mimeType: image.mimeType,
         prompt: caption || "Popiš, co je na obrázku. Pokud je tam text, přepiš ho."
       });
 
-      await telegramApi("sendMessage", { chat_id: chatId, text: result.text });
+      // Pošleme do Vapi jako textový kontext pro tvého agenta
+      const input =
+        `Uživatel poslal obrázek (zdroj: ${image.source}).\n` +
+        (caption ? `Popisek od uživatele: ${caption}\n` : "") +
+        `Gemini analýza obrázku:\n${geminiText}`;
+
+      const reply = await vapiChat({ sessionId, input });
+      await telegramApi("sendMessage", { chat_id: chatId, text: reply });
       return res.sendStatus(200);
     }
 
-    // Pokud chceš text přes Gemini taky, dá se doplnit; zatím jen info:
+    // TEXT path
     if (msg?.text) {
-      await telegramApi("sendMessage", {
-        chat_id: chatId,
-        text: "Pošli fotku (nebo fotku s popiskem) a já ji zanalyzuju přes Gemini."
-      });
+      const reply = await vapiChat({ sessionId, input: msg.text });
+      await telegramApi("sendMessage", { chat_id: chatId, text: reply });
       return res.sendStatus(200);
     }
 
+    // other update types ignored
     return res.sendStatus(200);
   } catch (e) {
     console.error("ERROR", e);
@@ -126,4 +186,4 @@ app.post("/telegram", async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("listening on", port, "model:", GEMINI_MODEL));
+app.listen(port, () => console.log("listening on", port));
