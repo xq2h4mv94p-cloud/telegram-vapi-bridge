@@ -3,95 +3,144 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-app.use((req, res, next) => {
-  console.log("INCOMING", req.method, req.path);
-  next();
-});
-
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+// Pokud chceš stále textové dotazy posílat do Vapi:
 const VAPI_PRIVATE_KEY = process.env.VAPI_PRIVATE_KEY;
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
-
-// chatId -> sessionId
-const sessions = new Map();
+const sessions = new Map(); // chatId -> vapiSessionId
 
 app.get("/", (req, res) => res.send("ok"));
 
-app.post("/telegram", async (req, res) => {
-  console.log("BODY", JSON.stringify(req.body));
+async function telegramApi(method, body) {
+  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return await resp.json();
+}
 
-  try {
-    const msg = req.body?.message;
-    const chatId = msg?.chat?.id;
-    const text = msg?.text;
+async function getTelegramFileBytes(fileId) {
+  // 1) getFile -> file_path
+  const info = await telegramApi("getFile", { file_id: fileId });
+  const filePath = info?.result?.file_path;
+  if (!filePath) throw new Error("Telegram getFile did not return file_path");
 
-    if (!chatId || !text) {
-      console.log("IGNORED update (no chatId/text)");
-      return res.sendStatus(200);
+  // 2) download bytes
+  const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Failed to download file: ${r.status}`);
+  const arrayBuffer = await r.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+async function analyzeWithGemini({ imageBytes, prompt }) {
+  if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
+
+  // Gemini REST: models/gemini-1.5-flash
+  const resp = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt || "Popiš, co je na obrázku. Pokud je tam text, přepiš ho. Pokud je to problém, navrhni řešení." },
+              {
+                inlineData: {
+                  mimeType: "image/jpeg",
+                  data: imageBytes.toString("base64")
+                }
+              }
+            ]
+          }
+        ]
+      })
     }
+  );
 
-    if (!TELEGRAM_BOT_TOKEN || !VAPI_PRIVATE_KEY || !VAPI_ASSISTANT_ID) {
-      console.log("MISSING ENV VARS");
-      return res.sendStatus(200);
-    }
+  const data = await resp.json();
+  const text =
+    data?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join("\n") ||
+    data?.error?.message ||
+    JSON.stringify(data);
 
-    // 1) session (session už je svázaná s asistentem)
-    let sessionId = sessions.get(chatId);
-    if (!sessionId) {
-      const sResp = await fetch("https://api.vapi.ai/session", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${VAPI_PRIVATE_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          assistantId: VAPI_ASSISTANT_ID,
-          name: `tg:${chatId}`
-        })
-      });
+  return text;
+}
 
-      const s = await sResp.json();
-      console.log("SESSION RES", sResp.status, s);
+async function chatWithVapi({ chatId, text }) {
+  if (!VAPI_PRIVATE_KEY || !VAPI_ASSISTANT_ID) {
+    return "Text chat přes Vapi není nakonfigurovaný (chybí VAPI_PRIVATE_KEY nebo VAPI_ASSISTANT_ID).";
+  }
 
-      sessionId = s?.id;
-      if (sessionId) sessions.set(chatId, sessionId);
-    }
-
-    // 2) Vapi chat — POZOR: tady už NESMÍ být assistantId
-    const chatResp = await fetch("https://api.vapi.ai/chat", {
+  let sessionId = sessions.get(chatId);
+  if (!sessionId) {
+    const sResp = await fetch("https://api.vapi.ai/session", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${VAPI_PRIVATE_KEY}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        sessionId,
-        input: text
-      })
+      body: JSON.stringify({ assistantId: VAPI_ASSISTANT_ID, name: `tg:${chatId}` })
     });
+    const s = await sResp.json();
+    sessionId = s?.id;
+    if (sessionId) sessions.set(chatId, sessionId);
+  }
 
-    const chat = await chatResp.json();
-    console.log("CHAT RES", chatResp.status, chat);
+  const cResp = await fetch("https://api.vapi.ai/chat", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${VAPI_PRIVATE_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ sessionId, input: text })
+  });
+  const chat = await cResp.json();
 
-    const reply =
-      (Array.isArray(chat?.output) &&
-        chat.output.map((o) => o?.content).filter(Boolean).join("\n")) ||
-      chat?.output?.[0]?.content ||
-      chat?.text ||
-      chat?.message ||
-      "Vapi nevrátilo textovou odpověď.";
+  return (
+    (Array.isArray(chat?.output) && chat.output.map(o => o?.content).filter(Boolean).join("\n")) ||
+    chat?.message ||
+    "Vapi nevrátilo odpověď."
+  );
+}
 
-    const tgResp = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: reply })
-      }
-    );
+app.post("/telegram", async (req, res) => {
+  try {
+    const msg = req.body?.message;
+    const chatId = msg?.chat?.id;
 
-    const tg = await tgResp.json();
-    console.log("TELEGRAM SEND RES", tgResp.status, tg);
+    if (!chatId) return res.sendStatus(200);
+
+    // 1) Pokud je fotka
+    if (Array.isArray(msg?.photo) && msg.photo.length > 0) {
+      // Telegram posílá více velikostí, vezmeme největší
+      const best = msg.photo[msg.photo.length - 1];
+      const fileId = best.file_id;
+
+      const caption = msg.caption || ""; // text k fotce
+      const bytes = await getTelegramFileBytes(fileId);
+      const analysis = await analyzeWithGemini({
+        imageBytes: bytes,
+        prompt: caption || "Popiš, co je na obrázku. Pokud je tam text, přepiš ho."
+      });
+
+      await telegramApi("sendMessage", { chat_id: chatId, text: analysis });
+      return res.sendStatus(200);
+    }
+
+    // 2) Jinak text -> Vapi (nebo sem můžeš dát i Gemini text model)
+    const text = msg?.text;
+    if (text) {
+      const reply = await chatWithVapi({ chatId, text });
+      await telegramApi("sendMessage", { chat_id: chatId, text: reply });
+      return res.sendStatus(200);
+    }
 
     return res.sendStatus(200);
   } catch (e) {
